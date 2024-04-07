@@ -45,12 +45,13 @@ def unrotate(cache: torch.Tensor, seqlen: int) -> torch.Tensor:
 
 
 class CacheView:
+    # view on the cache, allows to update the cache and interleave the cache with the input
     def __init__(self, cache_k: torch.Tensor, cache_v: torch.Tensor, metadata: RotatingCacheInputMetadata, kv_seqlens: torch.Tensor):
         self.cache_k = cache_k
         self.cache_v = cache_v
         self.kv_seqlens = kv_seqlens
         self.metadata = metadata
-
+    # update the cache with the new keys and values
     def update(self, xk: torch.Tensor, xv: torch.Tensor):
         """
         to_cache_mask masks the last [sliding_window] tokens in each sequence
@@ -61,7 +62,7 @@ class CacheView:
         
         flat_cache_k.index_copy_(0, self.metadata.cache_positions, xk[self.metadata.to_cache_mask])
         flat_cache_v.index_copy_(0, self.metadata.cache_positions, xv[self.metadata.to_cache_mask])
-
+    # interleave the cache with the input
     def interleave_kv(self, xk: torch.Tensor, xv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         This is a naive implementation and not optimized for speed.
@@ -109,6 +110,8 @@ class CacheView:
 
 
 class RotatingBufferCache:
+    # rolling buffer cache, the cache has a fixed size and is rotated, key and value are stored separately
+    # 
     """
     This is an example that implements a less naive rotating buffer cache, allowing for variable length sequences.
     Allocated cache is rectangular which is wasteful (see PagedAttention for better mechanisms)

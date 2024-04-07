@@ -18,6 +18,7 @@ class MoeArgs(Serializable):
     num_experts_per_tok: int
 
 
+# model parameters
 @dataclass
 class ModelArgs(Serializable):
     dim: int
@@ -33,7 +34,7 @@ class ModelArgs(Serializable):
     max_batch_size: int = 0
     max_seq_len: int = 0
 
-
+# The function are repeating the kv pairs for the attention mechanism
 def repeat_kv(keys: torch.Tensor, values: torch.Tensor, repeats: int):
     keys = torch.repeat_interleave(keys, repeats=repeats, dim=2)
     values = torch.repeat_interleave(values, repeats=repeats, dim=2)

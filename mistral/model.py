@@ -41,7 +41,8 @@ class ModelArgs(Serializable):
 class SimpleInputMetadata:
     # rope absolute positions
     positions: torch.Tensor
-
+    
+    # Create a SimpleInputMetadata object from a list of sequence lengths
     @staticmethod
     def from_seqlens(seqlens: List[int], device: torch.device) -> "SimpleInputMetadata":
         return SimpleInputMetadata(
@@ -50,7 +51,7 @@ class SimpleInputMetadata:
             )
         )
 
-
+# Helper function to repeat keys and values to match number of query heads
 def repeat_kv(keys: torch.Tensor, values: torch.Tensor, repeats: int, dim: int):
     keys = torch.repeat_interleave(keys, repeats=repeats, dim=dim)
     values = torch.repeat_interleave(values, repeats=repeats, dim=dim)
@@ -58,6 +59,8 @@ def repeat_kv(keys: torch.Tensor, values: torch.Tensor, repeats: int, dim: int):
 
 
 class Attention(nn.Module):
+    # Attention module, the differenc with llama2 is that we have a sliding window cache and we use rotary embeddings
+    # the forward method is the same as llama2
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -89,6 +92,9 @@ class Attention(nn.Module):
         xv = xv.view(seqlen_sum, self.n_kv_heads, self.head_dim)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
+        # sliding window cache, SWA(sliding window attention) why do we need this?
+        # SWA is a technique to reduce the memory footprint of the transformer model
+        # by storing the key and value tensors of the previous layers in a cache.
         if cache is None:
             key, val = xk, xv
         elif cache.prefill:
@@ -98,7 +104,7 @@ class Attention(nn.Module):
             cache.update(xk, xv)
             key, val = cache.key, cache.value
             key = key.view(
-                seqlen_sum * cache.sliding_window, self.n_kv_heads, self.head_dim
+                seqlen_sum * cache.sliding_window, self.n_kv_heads, self.head_dim # sliding windwo 
             )
             val = val.view(
                 seqlen_sum * cache.sliding_window, self.n_kv_heads, self.head_dim
@@ -119,16 +125,17 @@ class Attention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-
+        # FeedForward module, the forward method is the same as llama2
         self.w1 = nn.Linear(args.dim, args.hidden_dim, bias=False)
         self.w2 = nn.Linear(args.hidden_dim, args.dim, bias=False)
         self.w3 = nn.Linear(args.dim, args.hidden_dim, bias=False)
 
     def forward(self, x) -> torch.Tensor:
-        return self.w2(nn.functional.silu(self.w1(x)) * self.w3(x))
+        return self.w2(nn.functional.silu(self.w1(x)) * self.w3(x)) 
 
 
 class RMSNorm(torch.nn.Module):
+    # Root Mean Square Layer Normalization
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -154,19 +161,23 @@ class TransformerBlock(nn.Module):
 
         self.feed_forward: nn.Module
         if args.moe is not None:
+            # If we have MoE, we use a MoE layer instead of a simple feed forward.
             self.feed_forward = MoeLayer(
                 experts=[FeedForward(args=args) for _ in range(args.moe.num_experts)],
                 gate=nn.Linear(args.dim, args.moe.num_experts, bias=False),
                 moe_args=args.moe,
             )
         else:
+            # Otherwise, we use a simple feed forward layer.
             self.feed_forward = FeedForward(args=args)
 
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
+        # Attention module
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         h = x + r
+        # FeedForward module
         r = self.feed_forward.forward(self.ffn_norm(h))
         out = h + r
         return out
@@ -181,17 +192,24 @@ class Transformer(nn.Module):
     ):
         super().__init__()
         self.args = args
+        #vocab_size is the size of the vocabulary
         self.vocab_size = args.vocab_size
+        #n_layers is the number of layers in the transformer
         self.n_layers = args.n_layers
+        # precomputed_freqs_cis is the precomputed frequencies for the rotary embeddings
         self._precomputed_freqs_cis: Optional[torch.Tensor] = None
         assert self.vocab_size > 0
         assert pipeline_rank < num_pipeline_ranks, (pipeline_rank, num_pipeline_ranks)
+        # Pipeline parallelism parameters
         self.pipeline_rank = pipeline_rank
+        # Number of pipeline ranks
         self.num_pipeline_ranks = num_pipeline_ranks
         # Modules specific to some ranks:
         self.tok_embeddings: Optional[nn.Embedding] = None
+        # RMSNorm is a root mean square layer normalization
         self.norm: Optional[RMSNorm] = None
         self.output: Optional[nn.Linear] = None
+        # Initialize the modules that are shared across all ranks.
         if pipeline_rank == 0:
             self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
         if pipeline_rank == num_pipeline_ranks - 1:
@@ -199,9 +217,12 @@ class Transformer(nn.Module):
             self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         # Initialize all layers but slice off those not of this rank.
         layers = [TransformerBlock(args=args) for _ in range(args.n_layers)]
+        # Number of layers per rank
         num_layers_per_rank = math.ceil(self.n_layers / self.num_pipeline_ranks)
+        # Offset
         offset = self.pipeline_rank * num_layers_per_rank
         end = min(self.n_layers, offset + num_layers_per_rank)
+        # Initialize the layers
         self.layers = nn.ModuleDict({str(i): layers[i] for i in range(offset, end)})
         self.n_local_layers = len(self.layers)
 
@@ -244,6 +265,8 @@ class Transformer(nn.Module):
         If doing pipeline parallelism, this will return the activations of the last layer of this stage.
         For the last stage, this will return the normalized final embeddings.
         """
+        # why forward_partial? what is the difference with forward?
+        # 
         assert (
             len(seqlens) <= self.args.max_batch_size
         ), f"Max batch size is {self.args.max_batch_size}, got batch size of {len(seqlens)}"
@@ -264,7 +287,7 @@ class Transformer(nn.Module):
             torch.distributed.recv(h, src=self.pipeline_rank - 1)
 
         freqs_cis = self.freqs_cis[input_metadata.positions]
-
+        # Forward pass through all the transformer layers
         for local_layer_id, layer in enumerate(self.layers.values()):
             if cache is not None:
                 assert input_metadata is not None
@@ -275,6 +298,7 @@ class Transformer(nn.Module):
 
         if cache is not None:
             cache.update_seqlens(seqlens)
+        # piopeline parallelism
         if self.pipeline_rank < self.num_pipeline_ranks - 1:
             torch.distributed.send(h, dst=self.pipeline_rank + 1)
             return h
@@ -289,6 +313,7 @@ class Transformer(nn.Module):
         seqlens: List[int],
         cache: Optional[RotatingBufferCache] = None,
     ) -> torch.Tensor:
+        # Forward pass through the transformer
         h = self.forward_partial(input_ids, seqlens, cache=cache)
         if self.pipeline_rank < self.num_pipeline_ranks - 1:
             # ignore the intermediate activations as we'll get the final output from
@@ -302,7 +327,8 @@ class Transformer(nn.Module):
         if self.num_pipeline_ranks > 1:
             torch.distributed.broadcast(outs, src=self.num_pipeline_ranks - 1)
         return outs.float()
-
+    
+    # load the model from an existing state dictionary
     def load_state_dict(self, state_dict, *args, **kwargs):
         state_to_load = {}
         skipped = set([])
@@ -351,6 +377,7 @@ class Transformer(nn.Module):
         device="cuda",
         dtype=torch.float16,
     ) -> "Transformer":
+        # load the model from a folder
         with open(folder / "params.json", "r") as f:
             model_args = ModelArgs.from_dict(json.load(f))
         model_args.max_batch_size = max_batch_size
